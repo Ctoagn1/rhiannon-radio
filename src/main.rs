@@ -51,29 +51,37 @@ fn read_rtl(reader: AsyncReadHandle, tx: Sender<Vec<Complex32>>) {
 }
 
 fn fm_demod(rtl_rx: Receiver<Vec<Complex32>>, aud_tx: Sender<Vec<f32>>) {
+    //normalized cutoff of .0416, cutoff of 100KHz/2.4MHz
+    //audio normalized cutoff of .0625, 15KHz/240KHz
+    let iq_taps = vec![0.000, 0.000, -0.000, -0.000, -0.000, -0.001, -0.001, -0.001, -0.001, -0.001, -0.001, -0.001, -0.001, -0.000, 0.000, 0.001, 0.002, 0.003, 0.003, 0.004, 0.004, 0.004, 0.004, 0.004, 0.002, 0.001, -0.001, -0.003, -0.006, -0.008, -0.010, -0.012, -0.013, -0.014, -0.013, -0.011, -0.007, -0.003, 0.003, 0.011, 0.019, 0.028, 0.037, 0.047, 0.056, 0.064, 0.071, 0.077, 0.081, 0.083, 0.083, 0.081, 0.077, 0.071, 0.064, 0.056, 0.047, 0.037, 0.028, 0.019, 0.011, 0.003, -0.003, -0.007, -0.011, -0.013, -0.014, -0.013, -0.012, -0.010, -0.008, -0.006, -0.003, -0.001, 0.001, 0.002, 0.004, 0.004, 0.004, 0.004, 0.004, 0.003, 0.003, 0.002, 0.001, 0.000, -0.000, -0.001, -0.001, -0.001, -0.001, -0.001, -0.001, -0.001, -0.001, -0.000, -0.000, -0.000, 0.000, 0.000];
+    let aud_taps = vec![0.000, 0.000, -0.000, -0.000, -0.001, -0.001, -0.001, -0.001, -0.001, -0.000, 0.000, 0.001, 0.001, 0.002, 0.002, 0.002, 0.002, 0.001, -0.001, -0.002, -0.004, -0.005, -0.005, -0.005, -0.004, -0.001, 0.002, 0.005, 0.008, 0.010, 0.011, 0.010, 0.008, 0.003, -0.003, -0.010, -0.016, -0.022, -0.024, -0.023, -0.017, -0.007, 0.008, 0.026, 0.047, 0.068, 0.088, 0.105, 0.118, 0.124, 0.124, 0.118, 0.105, 0.088, 0.068, 0.047, 0.026, 0.008, -0.007, -0.017, -0.023, -0.024, -0.022, -0.016, -0.010, -0.003, 0.003, 0.008, 0.010, 0.011, 0.010, 0.008, 0.005, 0.002, -0.001, -0.004, -0.005, -0.005, -0.005, -0.004, -0.002, -0.001, 0.001, 0.002, 0.002, 0.002, 0.002, 0.001, 0.001, 0.000, -0.000, -0.001, -0.001, -0.001, -0.001, -0.001, -0.000, -0.000, 0.000, 0.000];
 
-    let taps = vec![0.000, 0.000, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.002, 0.002, 0.002, 0.003, 0.003, 0.004, 0.004, 0.005, 0.005, 0.006, 0.007, 0.008, 0.008, 0.009, 0.010, 0.011, 0.012, 0.013, 0.013, 0.014, 0.015, 0.016, 0.016, 0.017, 0.018, 0.018, 0.019, 0.019, 0.019, 0.020, 0.020, 0.020, 0.020, 0.020, 0.020, 0.019, 0.019, 0.019, 0.018, 0.018, 0.017, 0.016, 0.016, 0.015, 0.014, 0.013, 0.013, 0.012, 0.011, 0.010, 0.009, 0.008, 0.008, 0.007, 0.006, 0.005, 0.005, 0.004, 0.004, 0.003, 0.003, 0.002, 0.002, 0.002, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.000, 0.000];
-
-    let decimate = 50;
+    let iq_decimate = 10;
+    let aud_decimate = 5;
     let block_size = 512;
 
-    let mut lowpass = FirFilterDecimate::new(taps, decimate);
+    let mut iq_lowpass = FirFilterDecimate::new(iq_taps, iq_decimate);
+    let mut aud_lowpass = FirFilterDecimate::new(aud_taps, aud_decimate);
+
     let mut demod = FmDemod::new(Complex32::new(1.0, 0.0));
 
     let mut audio_block: Vec<f32> = Vec::with_capacity(block_size);
 
     while let Ok(block) = rtl_rx.recv() {
         for sample in block {
-            let diff = demod.process(sample);
-            if let Some(sample) = lowpass.process(diff){
-                audio_block.push(sample);
+            if let Some(filt_iq) = iq_lowpass.process(sample){
+                
+                let diff = demod.process(filt_iq);
+                if let Some(aud_sample) = aud_lowpass.process(diff){
+                    audio_block.push(aud_sample);
 
-                if audio_block.len() == block_size {
-                    let full_block = mem::replace(
-                        &mut audio_block,
-                        Vec::with_capacity(block_size),
-                    );
-                    aud_tx.send(full_block).unwrap();
+                    if audio_block.len() == block_size {
+                        let full_block = mem::replace(
+                            &mut audio_block,
+                            Vec::with_capacity(block_size),
+                        );
+                        aud_tx.send(full_block).unwrap();
+                    }
                 }
             }
         }
