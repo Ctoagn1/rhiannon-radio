@@ -19,7 +19,7 @@ where
         let len = coeffs.len();
         Self {
             coeffs,
-            history: vec![T::zero(); len],
+            history: vec![T::zero(); len*2],
             pos: 0,
             decimation,
             d_count: 0,
@@ -28,6 +28,7 @@ where
 
     pub fn process(&mut self, input: T) -> Option<T> {
         self.history[self.pos] = input;
+        self.history[self.pos + self.coeffs.len()] = input;
 
         let mut out: Option<T> = None;
 
@@ -47,7 +48,7 @@ where
             }
             out = Some(acc);
         }
-        self.pos = (self.pos + 1) % self.history.len();
+        self.pos = if self.pos == 0 { self.coeffs.len() - 1 } else { self.pos - 1 };
         self.d_count = (self.d_count + 1) % self.decimation;
         out
     }
@@ -94,5 +95,32 @@ impl AudioState {
         let sample = self.current_block[self.idx];
         self.idx += 1;
         sample
+    }
+}
+pub struct FreqShift {
+    signal_freq: f32,
+    sample_rate: usize,
+    osc: Complex32,
+    rotation: Complex32,
+}
+
+impl FreqShift {
+    pub fn new(signal_freq: f32, sample_rate: usize) -> Self {
+        let phase_inc = std::f32::consts::TAU * signal_freq / sample_rate as f32;
+        FreqShift {
+            signal_freq, 
+            sample_rate, 
+            osc: Complex32::new(1.0, 0.0),
+            rotation: Complex32::new(phase_inc.cos(), -phase_inc.sin()),
+        }
+    }
+    pub fn change_freq(&mut self, new_signal_freq: f32){
+        self.signal_freq = new_signal_freq;
+        let phase_inc = std::f32::consts::TAU * self.signal_freq / self.sample_rate as f32;
+        self.rotation = Complex32::new(phase_inc.cos(), phase_inc.sin());
+    }
+    pub fn process(&mut self, sample: Complex32) -> Complex32 {
+        self.osc *= self.rotation;
+        sample * self.osc
     }
 }
