@@ -1,44 +1,41 @@
 use rs_rtl::{DeviceId, RtlSdr, AsyncReadHandle};
-use std::{error::Error, sync::mpsc::{self, Receiver, Sender}, thread};
+use std::{thread, time::Duration};
+use std::thread::sleep;
 use std::mem;
+use std::sync::{Arc, Mutex};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 
 use cpal::{Stream, FromSample, OutputCallbackInfo, Sample, SizedSample, StreamConfig, traits::{DeviceTrait, HostTrait, StreamTrait}
 };
 
+use ratatui::layout::{Rect};
+use ratatui::buffer::Buffer;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::{
+    Axis, BarChart, Block, Cell, Chart, Dataset, Widget, 
+};
+
+use ratatui::text::{self, Span};
+
+use ratatui::{symbols, Frame, DefaultTerminal};
+
 use num::complex::Complex32;
 
 mod signalproc;
-use signalproc::{FmDemod, FirFilterDecimate, AudioState, FreqShift};
+use signalproc::{FmDemod, FirFilterDecimate, AudioState, FreqShift, FftData};
 
 use color_eyre::eyre::Result;
+use crossbeam_channel::{unbounded, Receiver, Sender};
+
 
 fn main() -> Result<()> {
     color_eyre::install()?;
-    let mut sdr = RtlSdr::open(DeviceId::Index(0))?;
-
-    sdr.set_center_freq(90_000_000)?;
-    sdr.set_sample_rate(2_400_000)?;
-    sdr.set_gain_manual(496)?;
-
-    let reader = sdr.start_streaming()?;
-    let (rtl_tx, rtl_rx) = mpsc::channel();
-    let (aud_tx, aud_rx) = mpsc::channel();
-
-    let aud: AudioState = AudioState::new(aud_rx);
-    let stream = init_audio_stream::<f32>(aud);
-    stream.play().unwrap();
-
-    let readhandle = thread::spawn(move || read_rtl(reader, rtl_tx));
-    let prochandle = thread::spawn(move || fm_demod(rtl_rx, aud_tx));
-    
-    readhandle.join().unwrap();
-    prochandle.join().unwrap();
-
-    Ok(())
+    ratatui::run(|terminal| App::new(Duration::new(0, 20_000_000)).run(terminal))
 }
 
 
-fn read_rtl(reader: AsyncReadHandle, tx: Sender<Vec<Complex32>>) {
+
+fn read_rtl(reader: AsyncReadHandle, dsp_tx: Sender<Vec<Complex32>>, latest: Arc<Mutex<Vec<Complex32>>>) {
 
     while let Some(data) = reader.recv() {
         let mut samples = Vec::with_capacity(data.len() / 2);
@@ -48,7 +45,8 @@ fn read_rtl(reader: AsyncReadHandle, tx: Sender<Vec<Complex32>>) {
             let q = (chunk[1] as f32 - 128.0) / 128.0;
             samples.push(Complex32::new(i, q));
         }
-        tx.send(samples).unwrap();
+        *latest.lock().unwrap() = samples.clone();
+        if dsp_tx.send(samples).is_err() {return};
     }
 }
 
@@ -84,7 +82,7 @@ fn fm_demod(rtl_rx: Receiver<Vec<Complex32>>, aud_tx: Sender<Vec<f32>>) {
                             &mut audio_block,
                             Vec::with_capacity(block_size),
                         );
-                        aud_tx.send(full_block).unwrap();
+                        if aud_tx.send(full_block).is_err() {return};
                     }
                 }
             }
@@ -132,5 +130,140 @@ where
         for sample in frame.iter_mut() {
             *sample = value;
         }
+    }
+}
+
+pub struct App {
+    fft: FftData,
+    snapshot: Option<Arc<Mutex<Vec<Complex32>>>>,
+    exit: bool,
+    tick_rate: Duration,
+    audio_out: Option<Stream>,
+    sdr: Option<RtlSdr>,
+}
+
+impl App {
+    pub fn new(tick_rate: Duration) -> Self {
+
+        let fft = FftData::new(90_000_000.0, 2_400_000, 16384);
+        let mut app = App {
+            fft,
+            snapshot: None,
+            exit: false,
+            tick_rate,
+            audio_out: None,
+            sdr: None,
+        };
+        _ = app.init_pipeline();
+        app
+    }
+
+    fn init_pipeline(&mut self) -> Result<()> {
+        let mut sdr = RtlSdr::open(DeviceId::Index(0))?;
+
+        sdr.set_center_freq(90_000_000)?;
+        sdr.set_sample_rate(2_400_000)?;
+        sdr.set_gain_manual(496)?;
+
+        let reader = sdr.start_streaming()?;
+        let (rtl_tx, rtl_rx) = unbounded();
+        let (aud_tx, aud_rx) = unbounded();
+        let fft_snapshot = Arc::new(Mutex::new(Vec::new()));
+        self.snapshot = Some(fft_snapshot.clone());
+
+        let aud: AudioState = AudioState::new(aud_rx);
+        let stream = init_audio_stream::<f32>(aud);
+        stream.play().unwrap();
+        self.audio_out = Some(stream);
+        self.sdr = Some(sdr);
+
+        thread::spawn(move || read_rtl(reader, rtl_tx, fft_snapshot.clone()));
+        thread::spawn(move || fm_demod(rtl_rx, aud_tx));
+        Ok(())
+    }
+
+
+    pub fn on_tick(&mut self) {
+        if self.snapshot.is_none() {return};
+        self.fft.update(self.snapshot.as_ref().unwrap());
+    }
+
+    pub fn draw(&self, frame: &mut Frame) {
+        frame.render_widget(self, frame.area());
+    }
+
+    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        while !self.exit {
+            terminal.draw(|frame| self.draw(frame))?;
+            if self.snapshot.is_some() {self.fft.update(self.snapshot.as_ref().unwrap())}
+            _ = self.handle_events();
+            thread::sleep(self.tick_rate);
+        }
+        Ok(())
+    }
+
+
+    fn handle_events(&mut self) -> Result<()> {
+        if !event::poll(Duration::from_millis(5)).is_ok_and(|x| x) {return Ok(())}
+        match event::read()? {
+            Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
+                self.handle_key_event(key_event);
+            }
+            _ => {}
+        };
+        Ok(())
+    }
+
+    fn exit(&mut self){
+        self.exit = true;
+    }
+
+    pub 
+
+    fn handle_key_event(&mut self, key_event: KeyEvent) {
+        match key_event.code {
+            KeyCode:: Char('q') => self.exit(),
+            _ => {}
+        }
+    }
+
+}
+
+impl Widget for &App{
+
+    fn render(self, area: Rect, buf: &mut Buffer) {
+
+        let dataset = Dataset::default()
+                .name("Frequencies")
+                .marker(symbols::Marker::Braille)
+                .style(Style::default().fg(Color::Green))
+                .data(&self.fft.data);
+
+        let center = self.fft.center_freq;
+        let half = self.fft.sample_rate as f64 / 2.0 ;
+
+        let x_axis = Axis::default()
+            .title("Frequency")
+            .bounds([center - half, center + half])
+            .labels([
+                (center - half).to_string(),
+                (center - (half/2.0)).to_string(),
+                center.to_string(),
+                (center + (half/2.0)).to_string(), 
+                (center + half).to_string()
+            ]);
+
+        let y_axis = Axis::default()
+            .title("dBFS")
+            .bounds([-60.0, 0.0])
+            .labels(["-60", "-50", "-40", "-30", "-20", "-10", "0"]);
+        
+        let block = Block::bordered().title(Span::styled("Spectrum Visualizer",
+            Style::default()
+            .fg(Color::Cyan)
+            .add_modifier((Modifier::BOLD),
+        )));
+
+        Chart::new(vec![dataset]).block(block).x_axis(x_axis).y_axis(y_axis).render(area, buf);
     }
 }

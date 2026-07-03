@@ -1,7 +1,9 @@
-use std::{ops::{AddAssign, Mul},  sync::mpsc::Receiver};
-
+use std::ops::{AddAssign, Mul};
+use crossbeam_channel::{Receiver};
 use num::{Zero, complex::Complex32};
-
+use color_eyre::eyre::Result;
+use rustfft::{FftPlanner, Fft};
+use std::sync::{Arc, Mutex};
 
 pub struct FirFilterDecimate<T> {
     coeffs: Vec<f32>,
@@ -122,5 +124,77 @@ impl FreqShift {
     pub fn process(&mut self, sample: Complex32) -> Complex32 {
         self.osc *= self.rotation;
         sample * self.osc
+    }
+}
+
+pub struct FftData {
+    pub data: Vec<(f64, f64)>,
+    pub center_freq: f64,
+    pub sample_rate: usize,
+
+
+    fft: Arc<dyn Fft<f32>>,
+    fft_planner: FftPlanner<f32>,
+    fft_size: usize,
+}
+impl FftData {
+
+    pub fn new(center_freq: f64, sample_rate: usize, fft_size: usize) -> Self {
+        let mut fft_planner = FftPlanner::new();
+        let fft = fft_planner.plan_fft_forward(fft_size);
+        FftData {
+            data: Vec::new(),
+            center_freq,
+            sample_rate,
+            fft,
+            fft_planner,
+            fft_size,
+        }
+    }
+
+    pub fn update(&mut self, sample_rx: &Arc<Mutex<Vec<Complex32>>>) {
+        let sample_block = sample_rx.lock().unwrap();
+
+        let bin_width = self.sample_rate as f64 / self.fft_size as f64;
+        let half = self.fft_size / 2;
+
+        let mut padded_block;
+        if sample_block.len() < self.fft_size {
+            padded_block = vec![Complex32::ZERO; self.fft_size];
+            padded_block[..sample_block.len()].copy_from_slice(&sample_block);
+        }
+        else {
+            padded_block = sample_block.clone();
+        }
+        let window: Vec<f32> = (0..self.fft_size)
+            .map(|i| {
+                0.5 * (1.0 - (std::f32::consts::TAU * i as f32 / (self.fft_size as f32 - 1.0)).cos())
+            })
+            .collect();
+        
+        padded_block = (0..self.fft_size)
+            .map(|i| padded_block[i] * window[i])
+            .collect();
+
+        self.fft.process(&mut padded_block);
+
+        let norm_factor = 1.0 / self.fft_size as f64;
+        self.data = (0..self.fft_size)
+            .map(|i| {
+                let idx = (i + half) % self.fft_size;
+
+                let freq = self.center_freq + (i as f64 - half as f64) * bin_width;
+
+                let amp = padded_block[idx].norm() as f64 * norm_factor;
+                let mag = 20.0 * amp.max(1e-12).log10();
+
+                (freq, mag)
+            })
+            .collect();
+    }
+    
+    pub fn change_size(&mut self, new_size: usize) {
+        self.fft = self.fft_planner.plan_fft_forward(new_size);
+        self.fft_size = new_size;
     }
 }
