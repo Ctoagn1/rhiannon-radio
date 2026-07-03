@@ -8,7 +8,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use cpal::{Stream, FromSample, OutputCallbackInfo, Sample, SizedSample, StreamConfig, traits::{DeviceTrait, HostTrait, StreamTrait}
 };
 
-use ratatui::layout::{Rect};
+use ratatui::layout::{Rect, Constraint, Layout};
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{
@@ -30,12 +30,12 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 
 fn main() -> Result<()> {
     color_eyre::install()?;
-    ratatui::run(|terminal| App::new(Duration::new(0, 20_000_000)).run(terminal))
+    ratatui::run(|terminal| App::new(Duration::new(0, 20_000_000)).unwrap().run(terminal))
 }
 
 
 
-fn read_rtl(reader: AsyncReadHandle, dsp_tx: Sender<Vec<Complex32>>, latest: Arc<Mutex<Vec<Complex32>>>) {
+fn rtl_handler(reader: AsyncReadHandle, dsp_tx: Sender<Vec<Complex32>>, latest: Arc<Mutex<Vec<Complex32>>>) {
 
     while let Some(data) = reader.recv() {
         let mut samples = Vec::with_capacity(data.len() / 2);
@@ -49,8 +49,7 @@ fn read_rtl(reader: AsyncReadHandle, dsp_tx: Sender<Vec<Complex32>>, latest: Arc
         if dsp_tx.send(samples).is_err() {return};
     }
 }
-
-fn fm_demod(rtl_rx: Receiver<Vec<Complex32>>, aud_tx: Sender<Vec<f32>>) {
+fn fm_demod(rtl_rx: Receiver<Vec<Complex32>>, aud_tx: Sender<Vec<f32>>, cmd_rx: Receiver<DspCommand>) {
     //normalized cutoff of .0416, cutoff of 100KHz/2.4MHz
     //audio normalized cutoff of .0625, 15KHz/240KHz
     //made using calculatorshub.net/electrical/fir-filter-coefficient-calculator/
@@ -63,13 +62,18 @@ fn fm_demod(rtl_rx: Receiver<Vec<Complex32>>, aud_tx: Sender<Vec<f32>>) {
 
     let mut iq_lowpass = FirFilterDecimate::new(iq_taps, iq_decimate);
     let mut aud_lowpass = FirFilterDecimate::new(aud_taps, aud_decimate);
-    let mut freq_shift = FreqShift::new(300_000.0, 2_400_000);
+    let mut freq_shift = FreqShift::new(0.0, 2_400_000);
 
     let mut demod = FmDemod::new(Complex32::new(1.0, 0.0));
 
     let mut audio_block: Vec<f32> = Vec::with_capacity(block_size);
 
     while let Ok(block) = rtl_rx.recv() {
+        if let Ok(cmd) = cmd_rx.try_recv(){
+            match cmd {
+                DspCommand::SetFreq(freq) => freq_shift.change_freq(freq),
+            }        
+        }
         for sample in block {
             let shift_sample = freq_shift.process(sample);
             if let Some(filt_iq) = iq_lowpass.process(shift_sample){
@@ -135,68 +139,67 @@ where
 
 pub struct App {
     fft: FftData,
-    snapshot: Option<Arc<Mutex<Vec<Complex32>>>>,
+    snapshot: Arc<Mutex<Vec<Complex32>>>,
     exit: bool,
     tick_rate: Duration,
-    audio_out: Option<Stream>,
-    sdr: Option<RtlSdr>,
+    audio_out: Stream,
+    sdr: RtlSdr,
+
+    sdr_cmd_tx: Sender<SdrCommand>,
+    dsp_cmd_tx: Sender<DspCommand>,
 }
 
 impl App {
-    pub fn new(tick_rate: Duration) -> Self {
-
-        let fft = FftData::new(90_000_000.0, 2_400_000, 16384);
-        let mut app = App {
-            fft,
-            snapshot: None,
-            exit: false,
-            tick_rate,
-            audio_out: None,
-            sdr: None,
-        };
-        _ = app.init_pipeline();
-        app
-    }
-
-    fn init_pipeline(&mut self) -> Result<()> {
+    pub fn new(tick_rate: Duration) -> Result<Self> {
         let mut sdr = RtlSdr::open(DeviceId::Index(0))?;
 
-        sdr.set_center_freq(90_000_000)?;
+        sdr.set_center_freq(90_300_000)?;
         sdr.set_sample_rate(2_400_000)?;
         sdr.set_gain_manual(496)?;
 
         let reader = sdr.start_streaming()?;
         let (rtl_tx, rtl_rx) = unbounded();
         let (aud_tx, aud_rx) = unbounded();
+
+        let (sdr_cmd_tx, sdr_cmd_rx) = unbounded();
+        let (dsp_cmd_tx, dsp_cmd_rx) = unbounded();
+
         let fft_snapshot = Arc::new(Mutex::new(Vec::new()));
-        self.snapshot = Some(fft_snapshot.clone());
 
         let aud: AudioState = AudioState::new(aud_rx);
         let stream = init_audio_stream::<f32>(aud);
         stream.play().unwrap();
-        self.audio_out = Some(stream);
-        self.sdr = Some(sdr);
+        
+        let snapclone = fft_snapshot.clone();
 
-        thread::spawn(move || read_rtl(reader, rtl_tx, fft_snapshot.clone()));
-        thread::spawn(move || fm_demod(rtl_rx, aud_tx));
-        Ok(())
-    }
+        thread::spawn(move || rtl_handler(reader, rtl_tx, snapclone));
+        thread::spawn(move || fm_demod(rtl_rx, aud_tx, dsp_cmd_rx));
+        
+        let fft = FftData::new(90_300_000.0, 2_400_000, 16384);
+        let app = App {
+            fft,
+            snapshot: fft_snapshot.clone(),
+            exit: false,
+            tick_rate,
+            audio_out: stream,
+            sdr,
+            sdr_cmd_tx,
+            dsp_cmd_tx,
+        };
 
-
-    pub fn on_tick(&mut self) {
-        if self.snapshot.is_none() {return};
-        self.fft.update(self.snapshot.as_ref().unwrap());
+        Ok(app)
     }
 
     pub fn draw(&self, frame: &mut Frame) {
+        
         frame.render_widget(self, frame.area());
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.exit {
             terminal.draw(|frame| self.draw(frame))?;
-            if self.snapshot.is_some() {self.fft.update(self.snapshot.as_ref().unwrap())}
-            _ = self.handle_events();
+            self.fft.update(&self.snapshot);
+            self.handle_events();
             thread::sleep(self.tick_rate);
         }
         Ok(())
@@ -222,8 +225,59 @@ impl App {
 
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         match key_event.code {
-            KeyCode:: Char('q') => self.exit(),
+            KeyCode::Char('q') => self.exit(),
+            KeyCode::Char('j') => {
+                self.fft.tuned_freq -= 1_000.0;
+                self.dsp_cmd_tx.send(DspCommand::SetFreq(self.fft.tuned_freq as f32));
+            }
+            KeyCode::Char('k') => {
+                self.fft.tuned_freq += 1_000.0;
+                self.dsp_cmd_tx.send(DspCommand::SetFreq(self.fft.tuned_freq as f32));
+            }
             _ => {}
+        }
+    }
+
+    fn render_spectrum(&self, area: Rect, buf: &mut Buffer) {
+
+        let dataset = Dataset::default()
+                .marker(symbols::Marker::Braille)
+                .style(Style::default().fg(Color::LightMagenta))
+                .data(&self.fft.data);
+
+        let center = self.fft.center_freq;
+        let half = self.fft.sample_rate as f64 / 2.0 ;
+
+        let x_axis = Axis::default()
+            .title(format_freq(self.fft.center_freq + self.fft.tuned_freq))
+            .bounds([center - half, center + half])
+            .labels([
+                format_freq(center - half),
+                format_freq(center - (half/2.0)),
+                format_freq(center),
+                format_freq(center + (half/2.0)), 
+                format_freq(center + half),
+            ]);
+
+
+        let y_axis = Axis::default()
+            .title("dBFS")
+            .bounds([-60.0, -20.0])
+            .labels(["-60", "-50", "-40", "-30", "-20"]);
+        
+        let block = Block::bordered().title(Span::styled("Spectrum Visualizer",
+            Style::default()
+            .fg(Color::LightRed)
+            .add_modifier(Modifier::BOLD)
+        ));
+
+        Chart::new(vec![dataset]).block(block).x_axis(x_axis).y_axis(y_axis).render(area, buf);
+        let tuned_freq = self.fft.tuned_freq + self.fft.center_freq;
+        let ratio = (tuned_freq - (center-half)) / (self.fft.sample_rate as f64);
+        let x = (area.width as f64 * ratio) as u16;
+        
+        for y in area.top()..area.bottom() {
+            buf[(x, y)].set_symbol("│").set_fg(Color::Red);
         }
     }
 
@@ -232,38 +286,33 @@ impl App {
 impl Widget for &App{
 
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let [top, bottom] = Layout::vertical([Constraint::Ratio(75, 25); 2]).areas(area);
+        let [bottom_right, bottom_left] = Layout::horizontal([Constraint::Fill(1); 2]).areas(bottom);
+        self.render_spectrum(top, buf);
 
-        let dataset = Dataset::default()
-                .name("Frequencies")
-                .marker(symbols::Marker::Braille)
-                .style(Style::default().fg(Color::Green))
-                .data(&self.fft.data);
-
-        let center = self.fft.center_freq;
-        let half = self.fft.sample_rate as f64 / 2.0 ;
-
-        let x_axis = Axis::default()
-            .title("Frequency")
-            .bounds([center - half, center + half])
-            .labels([
-                (center - half).to_string(),
-                (center - (half/2.0)).to_string(),
-                center.to_string(),
-                (center + (half/2.0)).to_string(), 
-                (center + half).to_string()
-            ]);
-
-        let y_axis = Axis::default()
-            .title("dBFS")
-            .bounds([-60.0, 0.0])
-            .labels(["-60", "-50", "-40", "-30", "-20", "-10", "0"]);
-        
-        let block = Block::bordered().title(Span::styled("Spectrum Visualizer",
-            Style::default()
-            .fg(Color::Cyan)
-            .add_modifier((Modifier::BOLD),
-        )));
-
-        Chart::new(vec![dataset]).block(block).x_axis(x_axis).y_axis(y_axis).render(area, buf);
     }
 }
+
+fn format_freq(freq: f64) -> String {
+    if freq >= 1e9 {
+        format!("{:.3} GHz", freq / 1e9)
+    } else if freq >= 1e6 {
+        format!("{:.3} MHz", freq / 1e6)
+    } else if freq >= 1e3 {
+        format!("{:.3} kHz", freq / 1e3)
+    } else {
+        format!("{:.0} Hz", freq)
+    }
+}
+
+enum SdrCommand {
+    On,
+    Off,
+    SetFreq(u32),
+    SetGain(i32)
+}
+
+enum DspCommand {
+    SetFreq(f32),
+}
+

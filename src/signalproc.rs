@@ -119,7 +119,7 @@ impl FreqShift {
     pub fn change_freq(&mut self, new_signal_freq: f32){
         self.signal_freq = new_signal_freq;
         let phase_inc = std::f32::consts::TAU * self.signal_freq / self.sample_rate as f32;
-        self.rotation = Complex32::new(phase_inc.cos(), phase_inc.sin());
+        self.rotation = Complex32::new(phase_inc.cos(), -phase_inc.sin());
     }
     pub fn process(&mut self, sample: Complex32) -> Complex32 {
         self.osc *= self.rotation;
@@ -130,6 +130,7 @@ impl FreqShift {
 pub struct FftData {
     pub data: Vec<(f64, f64)>,
     pub center_freq: f64,
+    pub tuned_freq: f64,
     pub sample_rate: usize,
 
 
@@ -145,6 +146,7 @@ impl FftData {
         FftData {
             data: Vec::new(),
             center_freq,
+            tuned_freq: 0.0,
             sample_rate,
             fft,
             fft_planner,
