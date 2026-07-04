@@ -90,7 +90,13 @@ impl AudioState {
 
     pub fn get_next_sample(&mut self) -> f32 {
         if self.idx >= self.current_block.len() {
-            self.current_block = self.rx.recv().unwrap();
+            let next = self.rx.try_recv();
+            if next.is_err() {
+                self.current_block = vec![0.0; 100];
+            }
+            else{
+                self.current_block = next.unwrap();
+            }
             self.idx = 0;
         }
 
@@ -130,7 +136,7 @@ impl FreqShift {
 pub struct FftData {
     pub data: Vec<(f64, f64)>,
     pub center_freq: f64,
-    pub tuned_freq: f64,
+    pub freq_offset: f64,
     pub sample_rate: usize,
 
 
@@ -146,7 +152,7 @@ impl FftData {
         FftData {
             data: Vec::new(),
             center_freq,
-            tuned_freq: 0.0,
+            freq_offset: 0.0,
             sample_rate,
             fft,
             fft_planner,

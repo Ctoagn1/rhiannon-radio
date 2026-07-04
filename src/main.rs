@@ -1,4 +1,4 @@
-use rs_rtl::{DeviceId, RtlSdr, AsyncReadHandle};
+use rs_rtl::{AsyncReadControlHandle, AsyncReadHandle, DeviceId, RtlSdr};
 use std::{thread, time::Duration};
 use std::thread::sleep;
 use std::mem;
@@ -35,20 +35,81 @@ fn main() -> Result<()> {
 
 
 
-fn rtl_handler(reader: AsyncReadHandle, dsp_tx: Sender<Vec<Complex32>>, latest: Arc<Mutex<Vec<Complex32>>>) {
+fn rtl_handler(cmd_rx: Receiver<SdrCommand>, dsp_tx: Sender<Vec<Complex32>>, latest: Arc<Mutex<Vec<Complex32>>>) {
+    let mut running = false;
+    let mut sdr: Option<RtlSdr> = None;
+    let mut reader: Option<AsyncReadHandle> = None;
 
-    while let Some(data) = reader.recv() {
-        let mut samples = Vec::with_capacity(data.len() / 2);
-        
-        for chunk in data.chunks_exact(2) {
-            let i = (chunk[0] as f32 - 128.0) / 128.0;
-            let q = (chunk[1] as f32 - 128.0) / 128.0;
-            samples.push(Complex32::new(i, q));
+    
+    loop {
+        if running{
+            if let Some(rdr) = reader.as_mut() {
+                if let Some(data) = rdr.recv() {
+                    let mut samples = Vec::with_capacity(data.len() / 2);
+                    
+                    for chunk in data.chunks_exact(2) {
+                        let i = (chunk[0] as f32 - 128.0) / 128.0;
+                        let q = (chunk[1] as f32 - 128.0) / 128.0;
+                        samples.push(Complex32::new(i, q));
+                    }
+                    *latest.lock().unwrap() = samples.clone();
+                    if dsp_tx.send(samples).is_err() {return};
+                }
+                else{
+                    reader = None;
+                    sdr = None;
+                    running = false;
+                }
+            }
         }
-        *latest.lock().unwrap() = samples.clone();
-        if dsp_tx.send(samples).is_err() {return};
+
+
+
+        let cmd = cmd_rx.try_recv();
+        match cmd {
+            Err(_) => {
+                if !running {sleep(Duration::from_millis(1))};
+
+            }
+            Ok(SdrCommand::Off) => {
+                running = false;
+            }
+            Ok(SdrCommand::On) => {
+                if reader.is_none() {
+                   if let Ok(mut usdr) = RtlSdr::open(DeviceId::Index(0)) {
+                        usdr.set_center_freq(90_300_000).unwrap();
+                        usdr.set_sample_rate(2_400_000).unwrap();
+                        usdr.set_gain_manual(496).unwrap();
+
+                        let r = usdr.start_streaming().unwrap();
+
+                        reader = Some(r);
+                        sdr = Some(usdr);
+                    }
+                }
+
+                if reader.is_some() {
+                    running = true;
+                }
+
+            }
+
+            Ok(SdrCommand::SetTuneFreq(freq)) => {
+                if let Some(sdr) = sdr.as_mut() {
+                    sdr.set_center_freq(freq).unwrap();
+                }
+            }
+            Ok(SdrCommand::SetGain(gain)) => {
+                if let Some(sdr) = sdr.as_mut() {
+                    sdr.set_gain_manual(gain).unwrap();
+                }
+            }
+
+        }
+
     }
 }
+
 fn fm_demod(rtl_rx: Receiver<Vec<Complex32>>, aud_tx: Sender<Vec<f32>>, cmd_rx: Receiver<DspCommand>) {
     //normalized cutoff of .0416, cutoff of 100KHz/2.4MHz
     //audio normalized cutoff of .0625, 15KHz/240KHz
@@ -71,7 +132,7 @@ fn fm_demod(rtl_rx: Receiver<Vec<Complex32>>, aud_tx: Sender<Vec<f32>>, cmd_rx: 
     while let Ok(block) = rtl_rx.recv() {
         if let Ok(cmd) = cmd_rx.try_recv(){
             match cmd {
-                DspCommand::SetFreq(freq) => freq_shift.change_freq(freq),
+                DspCommand::SetTuneFreq(freq) => freq_shift.change_freq(freq),
             }        
         }
         for sample in block {
@@ -143,7 +204,6 @@ pub struct App {
     exit: bool,
     tick_rate: Duration,
     audio_out: Stream,
-    sdr: RtlSdr,
 
     sdr_cmd_tx: Sender<SdrCommand>,
     dsp_cmd_tx: Sender<DspCommand>,
@@ -151,13 +211,7 @@ pub struct App {
 
 impl App {
     pub fn new(tick_rate: Duration) -> Result<Self> {
-        let mut sdr = RtlSdr::open(DeviceId::Index(0))?;
 
-        sdr.set_center_freq(90_300_000)?;
-        sdr.set_sample_rate(2_400_000)?;
-        sdr.set_gain_manual(496)?;
-
-        let reader = sdr.start_streaming()?;
         let (rtl_tx, rtl_rx) = unbounded();
         let (aud_tx, aud_rx) = unbounded();
 
@@ -172,7 +226,7 @@ impl App {
         
         let snapclone = fft_snapshot.clone();
 
-        thread::spawn(move || rtl_handler(reader, rtl_tx, snapclone));
+        thread::spawn(move || rtl_handler(sdr_cmd_rx, rtl_tx, snapclone));
         thread::spawn(move || fm_demod(rtl_rx, aud_tx, dsp_cmd_rx));
         
         let fft = FftData::new(90_300_000.0, 2_400_000, 16384);
@@ -182,7 +236,6 @@ impl App {
             exit: false,
             tick_rate,
             audio_out: stream,
-            sdr,
             sdr_cmd_tx,
             dsp_cmd_tx,
         };
@@ -227,16 +280,47 @@ impl App {
         match key_event.code {
             KeyCode::Char('q') => self.exit(),
             KeyCode::Char('j') => {
-                self.fft.tuned_freq -= 1_000.0;
-                self.dsp_cmd_tx.send(DspCommand::SetFreq(self.fft.tuned_freq as f32));
+                self.fft.freq_offset -= 1_000.0;
+                self.dsp_cmd_tx.send(DspCommand::SetTuneFreq(self.fft.freq_offset as f32));
+                self.check_recenter();
             }
             KeyCode::Char('k') => {
-                self.fft.tuned_freq += 1_000.0;
-                self.dsp_cmd_tx.send(DspCommand::SetFreq(self.fft.tuned_freq as f32));
+                self.fft.freq_offset += 1_000.0;
+                self.dsp_cmd_tx.send(DspCommand::SetTuneFreq(self.fft.freq_offset as f32));
+                self.check_recenter();
+            }
+            KeyCode::Char('c') => {
+                self.sdr_cmd_tx.send(SdrCommand::On);
+            }
+            KeyCode::Char('d') => {
+                self.sdr_cmd_tx.send(SdrCommand::Off);
             }
             _ => {}
         }
     }
+
+    fn check_recenter(&mut self) {
+        let span = self.fft.sample_rate as f64 / 4.0;
+        if self.fft.freq_offset > span {
+            self.fft.center_freq += span;     
+            self.fft.freq_offset -= span;
+
+            self.sdr_cmd_tx.send(SdrCommand::SetTuneFreq(self.fft.center_freq as u32));
+            self.dsp_cmd_tx.send(DspCommand::SetTuneFreq(self.fft.freq_offset as f32));
+        }
+
+        if self.fft.freq_offset < -span {
+            self.fft.center_freq -= span;    
+            self.fft.freq_offset += span;
+
+            self.sdr_cmd_tx.send(SdrCommand::SetTuneFreq(self.fft.center_freq as u32));
+            self.dsp_cmd_tx.send(DspCommand::SetTuneFreq(self.fft.freq_offset as f32));
+        }
+
+        
+    }
+
+
 
     fn render_spectrum(&self, area: Rect, buf: &mut Buffer) {
 
@@ -249,7 +333,7 @@ impl App {
         let half = self.fft.sample_rate as f64 / 2.0 ;
 
         let x_axis = Axis::default()
-            .title(format_freq(self.fft.center_freq + self.fft.tuned_freq))
+            .title(format_freq(self.fft.center_freq + self.fft.freq_offset))
             .bounds([center - half, center + half])
             .labels([
                 format_freq(center - half),
@@ -272,11 +356,12 @@ impl App {
         ));
 
         Chart::new(vec![dataset]).block(block).x_axis(x_axis).y_axis(y_axis).render(area, buf);
-        let tuned_freq = self.fft.tuned_freq + self.fft.center_freq;
+        let tuned_freq = self.fft.freq_offset + self.fft.center_freq;
         let ratio = (tuned_freq - (center-half)) / (self.fft.sample_rate as f64);
-        let x = (area.width as f64 * ratio) as u16;
+        let x = (area.width as f64 * ratio) as u16 + area.width / 15 ; // area.width / 15 for offset of chart in buffer
         
-        for y in area.top()..area.bottom() {
+        
+        for y in area.top()..(area.bottom() - (area.bottom() - area.top()) / 4) {
             buf[(x, y)].set_symbol("│").set_fg(Color::Red);
         }
     }
@@ -308,11 +393,11 @@ fn format_freq(freq: f64) -> String {
 enum SdrCommand {
     On,
     Off,
-    SetFreq(u32),
+    SetTuneFreq(u32),
     SetGain(i32)
 }
 
 enum DspCommand {
-    SetFreq(f32),
+    SetTuneFreq(f32),
 }
 
