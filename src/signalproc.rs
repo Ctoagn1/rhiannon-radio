@@ -1,7 +1,6 @@
 use std::ops::{AddAssign, Mul};
 use crossbeam_channel::{Receiver};
-use num::{Zero, complex::Complex32};
-use color_eyre::eyre::Result;
+use num::{Zero, complex::Complex32, traits::ConstZero};
 use rustfft::{FftPlanner, Fft};
 use std::sync::{Arc, Mutex};
 
@@ -28,30 +27,32 @@ where
         }
     }
 
-    pub fn process(&mut self, input: T) -> Option<T> {
-        self.history[self.pos] = input;
-        self.history[self.pos + self.coeffs.len()] = input;
+    pub fn process(&mut self, input_vec: Vec<T>) -> Vec<T> {
+        let mut out: Vec<T> = Vec::with_capacity(input_vec.len() / self.decimation + 1);
+        for input in input_vec{
+            self.history[self.pos] = input;
+            self.history[self.pos + self.coeffs.len()] = input;
 
-        let mut out: Option<T> = None;
+ 
+            if self.d_count == 0 {
 
-        if self.d_count == 0 {
+                let mut acc: T = T::zero();
+                let mut idx = self.pos;
 
-            let mut acc: T = T::zero();
-            let mut idx = self.pos;
+                for x in &self.coeffs {
+                    acc += self.history[idx] * *x;
 
-            for x in &self.coeffs {
-                acc += self.history[idx] * *x;
-
-                if idx == 0 {
-                    idx = self.history.len() - 1;
-                } else {
-                    idx -= 1;
+                    if idx == 0 {
+                        idx = self.history.len() - 1;
+                    } else {
+                        idx -= 1;
+                    }
                 }
+                out.push(acc);
             }
-            out = Some(acc);
+            self.pos = if self.pos == 0 { self.coeffs.len() - 1 } else { self.pos - 1 };
+            self.d_count = (self.d_count + 1) % self.decimation;
         }
-        self.pos = if self.pos == 0 { self.coeffs.len() - 1 } else { self.pos - 1 };
-        self.d_count = (self.d_count + 1) % self.decimation;
         out
     }
 }
@@ -65,12 +66,17 @@ impl FmDemod {
         FmDemod { prev: start }
     }
 
-    pub fn process(&mut self, input: Complex32) -> f32 {
-        let diff = (input * self.prev.conj()).arg();
-        self.prev = input;
-        diff
+    pub fn process(&mut self, inputs: Vec<Complex32>) -> Vec<f32> {
+        inputs.iter().map(|input| {
+                let diff = (input * self.prev.conj()).arg();
+                self.prev = *input;
+                diff
+            }
+            )
+            .collect()
     }
 }
+
 
 pub struct AudioState {
     current_block: Vec<f32>,
@@ -127,9 +133,49 @@ impl FreqShift {
         let phase_inc = std::f32::consts::TAU * self.signal_freq / self.sample_rate as f32;
         self.rotation = Complex32::new(phase_inc.cos(), -phase_inc.sin());
     }
-    pub fn process(&mut self, sample: Complex32) -> Complex32 {
-        self.osc *= self.rotation;
-        sample * self.osc
+    pub fn process(&mut self, samples: Vec<Complex32>) -> Vec<Complex32> {
+        let mut out = vec![Complex32::ZERO; samples.len()];
+        let mut out_idx = 0;
+        for s in samples {
+            self.osc *= self.rotation;
+            out[out_idx] = s * self.osc;
+            out_idx += 1;
+        }
+        out
+    }
+}
+
+pub struct FreqShiftReal {
+    signal_freq: f32,
+    sample_rate: usize,
+    osc: f32,
+    rotation: f32,
+}
+
+impl FreqShiftReal {
+    pub fn new(signal_freq: f32, sample_rate: usize) -> Self {
+        let phase_inc = std::f32::consts::TAU * signal_freq / sample_rate as f32;
+        FreqShiftReal {
+            signal_freq, 
+            sample_rate, 
+            osc: 0.0,
+            rotation: phase_inc,
+        }
+    }
+    pub fn change_freq(&mut self, new_signal_freq: f32){
+        self.signal_freq = new_signal_freq;
+        let phase_inc = std::f32::consts::TAU * self.signal_freq / self.sample_rate as f32;
+        self.rotation = phase_inc;
+    }
+    pub fn process(&mut self, samples: Vec<f32>) -> Vec<f32> {
+        let mut out = vec![0.0; samples.len()];
+        let mut out_idx = 0;
+        for s in samples {
+            self.osc = (self.osc + self.rotation) % std::f32::consts::TAU;
+            out[out_idx] = s * self.osc.cos();
+            out_idx += 1;
+        }
+        out
     }
 }
 
@@ -205,4 +251,40 @@ impl FftData {
         self.fft = self.fft_planner.plan_fft_forward(new_size);
         self.fft_size = new_size;
     }
+}
+
+pub struct RdsSampler {
+    samples_per_symbol: f32,
+    phase: f32
+}
+
+impl RdsSampler {
+    pub fn new(sample_rate: f32) -> Self{
+        let symbol_rate = 1187.5;
+        RdsSampler{samples_per_symbol: sample_rate / symbol_rate, phase: 0.0}
+    }
+
+    pub fn process(&mut self, signal: Vec<f32>) -> Vec<bool> {
+        let mut out = Vec::with_capacity(signal.len() / self.samples_per_symbol as usize + 1);
+
+        while (self.phase as usize) < signal.len() {
+            let idx = self.phase as usize;
+            let bit = signal[idx] > 0.0;
+            out.push(bit);
+
+            self.phase += self.samples_per_symbol;
+        }
+        self.phase -= signal.len() as f32;
+        out
+    }
+    pub fn diff_demod(&mut self, samples: Vec<bool>) -> Vec<bool> {
+        let mut prev = false;
+        samples.iter().map(|x| {
+            let out: bool = x ^ prev;
+            prev = *x;
+            out
+        })
+        .collect()
+    }
+
 }

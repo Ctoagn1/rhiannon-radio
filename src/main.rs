@@ -1,4 +1,4 @@
-use rs_rtl::{AsyncReadControlHandle, AsyncReadHandle, DeviceId, RtlSdr};
+use rs_rtl::{AsyncReadHandle, DeviceId, RtlSdr};
 use std::{thread, time::Duration};
 use std::thread::sleep;
 use std::mem;
@@ -9,23 +9,27 @@ use cpal::{Stream, FromSample, OutputCallbackInfo, Sample, SizedSample, StreamCo
 };
 
 use ratatui::layout::{Rect, Constraint, Layout};
-use ratatui::buffer::{self, Buffer};
+use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{
-    Axis, BarChart, Block, Clear, Chart, Dataset, Widget, Paragraph, Borders 
+    Axis, Block, Clear, Chart, Dataset, Widget, Paragraph, Borders 
 };
+use std::fs::OpenOptions;
+use std::io::Write;
 
-use ratatui::text::{self, Line, Span};
+
+use ratatui::text::Span;
 
 use ratatui::{symbols, Frame, DefaultTerminal};
 
 use num::complex::Complex32;
 
 mod signalproc;
-use signalproc::{FmDemod, FirFilterDecimate, AudioState, FreqShift, FftData};
+use signalproc::{FmDemod, FirFilterDecimate, AudioState, FreqShift, FreqShiftReal, FftData, RdsSampler };
 
 use color_eyre::eyre::Result;
 use crossbeam_channel::{unbounded, Receiver, Sender};
+
 
 
 fn main() -> Result<()> {
@@ -110,50 +114,76 @@ fn rtl_handler(cmd_rx: Receiver<SdrCommand>, dsp_tx: Sender<Vec<Complex32>>, lat
     }
 }
 
-fn fm_demod(rtl_rx: Receiver<Vec<Complex32>>, aud_tx: Sender<Vec<f32>>, cmd_rx: Receiver<DspCommand>) {
+fn rds_handler(signal_rx: Receiver<Vec<f32>>) {
+
+
+    let mut sampler = RdsSampler::new(12_000.0);
+    let mut shift = FreqShiftReal::new(57_000.0, 240_000);
+    //0.05 normalized cutoff, 60 -> 3
+    let rds_taps_3 = vec![0.000, 0.000, 0.000, 0.001, 0.001, 0.001, 0.001, 0.001, 0.000, 0.000, -0.000, -0.001, -0.001, -0.002, -0.002, -0.002, -0.003, -0.002, -0.002, -0.001, 0.001, 0.002, 0.004, 0.005, 0.006, 0.007, 0.007, 0.006, 0.004, 0.002, -0.002, -0.006, -0.010, -0.013, -0.016, -0.018, -0.018, -0.016, -0.011, -0.004, 0.005, 0.016, 0.028, 0.042, 0.056, 0.069, 0.080, 0.090, 0.096, 0.100, 0.100, 0.096, 0.090, 0.080, 0.069, 0.056, 0.042, 0.028, 0.016, 0.005, -0.004, -0.011, -0.016, -0.018, -0.018, -0.016, -0.013, -0.010, -0.006, -0.002, 0.002, 0.004, 0.006, 0.007, 0.007, 0.006, 0.005, 0.004, 0.002, 0.001, -0.001, -0.002, -0.002, -0.003, -0.002, -0.002, -0.002, -0.001, -0.001, -0.000, 0.000, 0.000, 0.001, 0.001, 0.001, 0.001, 0.001, 0.000, 0.000, 0.000];
+    //cutoff of 30 kHz, .125 normalized
+    let rds_taps_60 = vec![0.000, 0.000, -0.000, -0.001, -0.001, -0.000, 0.000, 0.001, 0.001, 0.000, -0.001, -0.001, -0.002, -0.001, 0.001, 0.002, 0.003, 0.001, -0.001, -0.004, -0.004, -0.002, 0.002, 0.005, 0.006, 0.003, -0.003, -0.008, -0.009, -0.004, 0.004, 0.011, 0.013, 0.006, -0.006, -0.017, -0.018, -0.008, 0.009, 0.025, 0.028, 0.013, -0.015, -0.043, -0.052, -0.027, 0.034, 0.117, 0.196, 0.244, 0.244, 0.196, 0.117, 0.034, -0.027, -0.052, -0.043, -0.015, 0.013, 0.028, 0.025, 0.009, -0.008, -0.018, -0.017, -0.006, 0.006, 0.013, 0.011, 0.004, -0.004, -0.009, -0.008, -0.003, 0.003, 0.006, 0.005, 0.002, -0.002, -0.004, -0.004, -0.001, 0.001, 0.003, 0.002, 0.001, -0.001, -0.002, -0.001, -0.001, 0.000, 0.001, 0.001, 0.000, -0.000, -0.001, -0.001, -0.000, 0.000, 0.000];
+    let mut rds_filter_3 = FirFilterDecimate::<f32>::new(rds_taps_3, 5);
+    let mut rds_filter_60 = FirFilterDecimate::new(rds_taps_60, 4);
+
+    while let Ok(signal_block) = signal_rx.recv() {
+        let shifted_signal_block = shift.process(signal_block);
+        let reduced_signal_block = rds_filter_60.process(shifted_signal_block);
+        let filtered_signal = rds_filter_3.process(reduced_signal_block);
+
+        let bin_data = sampler.process(filtered_signal);
+        let diff_bin_data = sampler.diff_demod(bin_data);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("rds_bits.log")
+            .unwrap();
+        for i in &diff_bin_data{
+            write!(file, "{}", if *i {1} else {0}).unwrap();
+        }
+        
+
+    }
+}
+
+fn fm_demod(rtl_rx: Receiver<Vec<Complex32>>, aud_tx: Sender<Vec<f32>>, cmd_rx: Receiver<DspCommand>, rds_tx: Sender<Vec<f32>>) {
     //normalized cutoff of .0416, cutoff of 100KHz/2.4MHz
     //audio normalized cutoff of .0625, 15KHz/240KHz
     //made using calculatorshub.net/electrical/fir-filter-coefficient-calculator/
     let iq_taps = vec![0.000, 0.000, -0.000, -0.000, -0.000, -0.001, -0.001, -0.001, -0.001, -0.001, -0.001, -0.001, -0.001, -0.000, 0.000, 0.001, 0.002, 0.003, 0.003, 0.004, 0.004, 0.004, 0.004, 0.004, 0.002, 0.001, -0.001, -0.003, -0.006, -0.008, -0.010, -0.012, -0.013, -0.014, -0.013, -0.011, -0.007, -0.003, 0.003, 0.011, 0.019, 0.028, 0.037, 0.047, 0.056, 0.064, 0.071, 0.077, 0.081, 0.083, 0.083, 0.081, 0.077, 0.071, 0.064, 0.056, 0.047, 0.037, 0.028, 0.019, 0.011, 0.003, -0.003, -0.007, -0.011, -0.013, -0.014, -0.013, -0.012, -0.010, -0.008, -0.006, -0.003, -0.001, 0.001, 0.002, 0.004, 0.004, 0.004, 0.004, 0.004, 0.003, 0.003, 0.002, 0.001, 0.000, -0.000, -0.001, -0.001, -0.001, -0.001, -0.001, -0.001, -0.001, -0.001, -0.000, -0.000, -0.000, 0.000, 0.000];
     let aud_taps = vec![0.000, 0.000, -0.000, -0.000, -0.001, -0.001, -0.001, -0.001, -0.001, -0.000, 0.000, 0.001, 0.001, 0.002, 0.002, 0.002, 0.002, 0.001, -0.001, -0.002, -0.004, -0.005, -0.005, -0.005, -0.004, -0.001, 0.002, 0.005, 0.008, 0.010, 0.011, 0.010, 0.008, 0.003, -0.003, -0.010, -0.016, -0.022, -0.024, -0.023, -0.017, -0.007, 0.008, 0.026, 0.047, 0.068, 0.088, 0.105, 0.118, 0.124, 0.124, 0.118, 0.105, 0.088, 0.068, 0.047, 0.026, 0.008, -0.007, -0.017, -0.023, -0.024, -0.022, -0.016, -0.010, -0.003, 0.003, 0.008, 0.010, 0.011, 0.010, 0.008, 0.005, 0.002, -0.001, -0.004, -0.005, -0.005, -0.005, -0.004, -0.002, -0.001, 0.001, 0.002, 0.002, 0.002, 0.002, 0.001, 0.001, 0.000, -0.000, -0.001, -0.001, -0.001, -0.001, -0.001, -0.000, -0.000, 0.000, 0.000];
-
     let iq_decimate = 10;
     let aud_decimate = 5;
     let block_size = 512;
+    let mut rds_on = false;
 
     let mut iq_lowpass = FirFilterDecimate::new(iq_taps, iq_decimate);
     let mut aud_lowpass = FirFilterDecimate::new(aud_taps, aud_decimate);
-    let mut freq_shift = FreqShift::new(0.0, 2_400_000);
 
+    let mut freq_shift = FreqShift::new(0.0, 2_400_000);
     let mut demod = FmDemod::new(Complex32::new(1.0, 0.0));
 
-    let mut audio_block: Vec<f32> = Vec::with_capacity(block_size);
 
     while let Ok(block) = rtl_rx.recv() {
         if let Ok(cmd) = cmd_rx.try_recv(){
             match cmd {
                 DspCommand::SetTuneFreq(freq) => freq_shift.change_freq(freq),
+                DspCommand::RdsOn => {rds_on = true;},
+                DspCommand::RdsOff => {rds_on = false;},
             }        
         }
-        for sample in block {
-            let shift_sample = freq_shift.process(sample);
-            if let Some(filt_iq) = iq_lowpass.process(shift_sample){
-                let diff = demod.process(filt_iq);
-                if let Some(aud_sample) = aud_lowpass.process(diff){
-                    audio_block.push(aud_sample);
-
-                    if audio_block.len() == block_size {
-                        let full_block = mem::replace(
-                            &mut audio_block,
-                            Vec::with_capacity(block_size),
-                        );
-                        if aud_tx.send(full_block).is_err() {return};
-                    }
-                }
-            }
+        let shifted_samples = freq_shift.process(block);
+        let filtered_iq = iq_lowpass.process(shifted_samples);
+        let demod_samples = demod.process(filtered_iq);
+        if rds_on {
+            rds_tx.send(demod_samples.clone());
         }
+        let aud_samples = aud_lowpass.process(demod_samples);
+        aud_tx.send(aud_samples);
+
     }
 }
+
 
 fn init_audio_stream<T>(mut aud: AudioState) -> Stream
 where
@@ -218,7 +248,7 @@ impl App {
 
         let (sdr_cmd_tx, sdr_cmd_rx) = unbounded();
         let (dsp_cmd_tx, dsp_cmd_rx) = unbounded();
-
+        let (rds_tx, rdx_rs) = unbounded();
         let fft_snapshot = Arc::new(Mutex::new(Vec::new()));
 
         let aud: AudioState = AudioState::new(aud_rx);
@@ -228,8 +258,8 @@ impl App {
         let snapclone = fft_snapshot.clone();
 
         thread::spawn(move || rtl_handler(sdr_cmd_rx, rtl_tx, snapclone));
-        thread::spawn(move || fm_demod(rtl_rx, aud_tx, dsp_cmd_rx));
-        
+        thread::spawn(move || fm_demod(rtl_rx, aud_tx, dsp_cmd_rx, rds_tx));
+        thread::spawn(move || rds_handler(rdx_rs));
         let fft = FftData::new(90_300_000.0, 2_400_000, 16384);
         let app = App {
             fft,
@@ -275,8 +305,6 @@ impl App {
     fn exit(&mut self){
         self.exit = true;
     }
-
-    pub 
 
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         match self.input_mode {
@@ -480,6 +508,8 @@ enum SdrCommand {
 
 enum DspCommand {
     SetTuneFreq(f32),
+    RdsOn,
+    RdsOff,
 }
 
 enum InputMode {
@@ -488,18 +518,18 @@ enum InputMode {
 }
 
 fn parse_frequency(freq: &String) -> Result<f64> {
-        let num_freq: f64;
-        if freq.contains('.'){
-            let mfreq = freq.parse::<f64>()?;
-            if mfreq < 1000.0 {
-                num_freq = mfreq * 1_000_000.0;
-            } else {
-                num_freq = mfreq;
-            }
+    let num_freq: f64;
+    if freq.contains('.'){
+        let mfreq = freq.parse::<f64>()?;
+        if mfreq < 1000.0 {
+            num_freq = mfreq * 1_000_000.0;
+        } else {
+            num_freq = mfreq;
         }
-        else {
-            let nfreq = freq.parse::<u32>()?;
-            num_freq = nfreq as f64;
-        }
-        Ok(num_freq)
     }
+    else {
+        let nfreq = freq.parse::<u32>()?;
+        num_freq = nfreq as f64;
+    }
+    Ok(num_freq)
+}
