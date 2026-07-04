@@ -9,13 +9,13 @@ use cpal::{Stream, FromSample, OutputCallbackInfo, Sample, SizedSample, StreamCo
 };
 
 use ratatui::layout::{Rect, Constraint, Layout};
-use ratatui::buffer::Buffer;
+use ratatui::buffer::{self, Buffer};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{
-    Axis, BarChart, Block, Cell, Chart, Dataset, Widget, 
+    Axis, BarChart, Block, Clear, Chart, Dataset, Widget, Paragraph, Borders 
 };
 
-use ratatui::text::{self, Span};
+use ratatui::text::{self, Line, Span};
 
 use ratatui::{symbols, Frame, DefaultTerminal};
 
@@ -96,12 +96,12 @@ fn rtl_handler(cmd_rx: Receiver<SdrCommand>, dsp_tx: Sender<Vec<Complex32>>, lat
 
             Ok(SdrCommand::SetTuneFreq(freq)) => {
                 if let Some(sdr) = sdr.as_mut() {
-                    sdr.set_center_freq(freq).unwrap();
+                    sdr.set_center_freq(freq);
                 }
             }
             Ok(SdrCommand::SetGain(gain)) => {
                 if let Some(sdr) = sdr.as_mut() {
-                    sdr.set_gain_manual(gain).unwrap();
+                    sdr.set_gain_manual(gain);
                 }
             }
 
@@ -207,6 +207,7 @@ pub struct App {
 
     sdr_cmd_tx: Sender<SdrCommand>,
     dsp_cmd_tx: Sender<DspCommand>,
+    input_mode: InputMode
 }
 
 impl App {
@@ -238,6 +239,7 @@ impl App {
             audio_out: stream,
             sdr_cmd_tx,
             dsp_cmd_tx,
+            input_mode: InputMode::NormalMode
         };
 
         Ok(app)
@@ -277,25 +279,69 @@ impl App {
     pub 
 
     fn handle_key_event(&mut self, key_event: KeyEvent) {
-        match key_event.code {
-            KeyCode::Char('q') => self.exit(),
-            KeyCode::Char('j') => {
-                self.fft.freq_offset -= 1_000.0;
-                self.dsp_cmd_tx.send(DspCommand::SetTuneFreq(self.fft.freq_offset as f32));
-                self.check_recenter();
+        match self.input_mode {
+            InputMode::NormalMode => {
+                match key_event.code {
+                    KeyCode::Char('q') => self.exit(),
+                    KeyCode::Char('j') => {
+                        self.fft.freq_offset -= 1_000.0;
+                        self.dsp_cmd_tx.send(DspCommand::SetTuneFreq(self.fft.freq_offset as f32));
+                        self.check_recenter();
+                    }
+                    KeyCode::Char('k') => {
+                        self.fft.freq_offset += 1_000.0;
+                        self.dsp_cmd_tx.send(DspCommand::SetTuneFreq(self.fft.freq_offset as f32));
+                        self.check_recenter();
+                    }
+                    KeyCode::Char('c') => {
+                        self.sdr_cmd_tx.send(SdrCommand::On);
+                        self.sdr_cmd_tx.send(SdrCommand::SetTuneFreq(self.fft.center_freq as u32));
+                    }
+                    KeyCode::Char('d') => {
+                        self.sdr_cmd_tx.send(SdrCommand::Off);
+                    }
+                    KeyCode::Char('t') => {
+                        self.input_mode = InputMode::FreqInput(String::new())
+                    }
+                    _ => {}
+                }
             }
-            KeyCode::Char('k') => {
-                self.fft.freq_offset += 1_000.0;
-                self.dsp_cmd_tx.send(DspCommand::SetTuneFreq(self.fft.freq_offset as f32));
-                self.check_recenter();
+            InputMode::FreqInput(ref mut buffer) => {
+                match key_event.code {
+                    KeyCode::Char(c) if c.is_ascii_digit() => {
+                        buffer.push(c);
+                     }
+
+                    KeyCode::Char('.') => {
+                        if !buffer.contains('.') {
+                            buffer.push('.');
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        buffer.pop();
+                    }
+                    KeyCode::Esc => {
+                        self.input_mode = InputMode::NormalMode;
+                    }
+                    KeyCode::Char('t') => {
+                        self.input_mode = InputMode::NormalMode;
+                    }
+
+                    KeyCode::Enter => {
+                        if let Ok(freq) = parse_frequency(&buffer) {
+                            self.sdr_cmd_tx.send(SdrCommand::SetTuneFreq(freq as u32));
+                            self.dsp_cmd_tx.send(DspCommand::SetTuneFreq(0.0));
+                            self.fft.center_freq = freq;
+                            self.fft.freq_offset = 0.0;
+                        }
+
+                        
+
+                        self.input_mode = InputMode::NormalMode;
+                    }
+                    _ => {}
+                }
             }
-            KeyCode::Char('c') => {
-                self.sdr_cmd_tx.send(SdrCommand::On);
-            }
-            KeyCode::Char('d') => {
-                self.sdr_cmd_tx.send(SdrCommand::Off);
-            }
-            _ => {}
         }
     }
 
@@ -320,7 +366,36 @@ impl App {
         
     }
 
+    fn render_command_box(&self, area: Rect, buf: &mut Buffer) {
+        let p = Paragraph::new(
+            "
+            Connect: <c>
+            Disconnect: <d>
+            Tune Down <j>
+            Tune Up <k>
+            Set Frequency <t>
+            Quit <q>"
+        )
+        .style(Style::default().fg(Color::White))
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title("Commands")
+        )
+        .render(area, buf);
 
+        
+    }
+    fn render_popup(&self, area: Rect, buf: &mut Buffer, freq_str: &String) {
+        let text = vec![
+            freq_str.as_str().into(),
+            "ESC to quit, Enter to set".into(),
+            "Accepts decimals as MHz, i.e 90.1 = 90100000".into(),
+        ];
+
+        Clear.render(area, buf);
+        Paragraph::new(text).block(Block::bordered().title("Set Frequency").style(Color::LightRed)).render(area, buf);
+        
+    }
 
     fn render_spectrum(&self, area: Rect, buf: &mut Buffer) {
 
@@ -373,7 +448,13 @@ impl Widget for &App{
     fn render(self, area: Rect, buf: &mut Buffer) {
         let [top, bottom] = Layout::vertical([Constraint::Ratio(75, 25); 2]).areas(area);
         let [bottom_right, bottom_left] = Layout::horizontal([Constraint::Fill(1); 2]).areas(bottom);
+        let centered_area = area.centered(Constraint::Percentage(60), Constraint::Percentage(20));
+
         self.render_spectrum(top, buf);
+        self.render_command_box(bottom_right, buf);
+        if let InputMode::FreqInput(freq_buf) = &self.input_mode {
+            self.render_popup(centered_area, buf, freq_buf);
+        }
 
     }
 }
@@ -401,3 +482,24 @@ enum DspCommand {
     SetTuneFreq(f32),
 }
 
+enum InputMode {
+    NormalMode,
+    FreqInput(String),
+}
+
+fn parse_frequency(freq: &String) -> Result<f64> {
+        let num_freq: f64;
+        if freq.contains('.'){
+            let mfreq = freq.parse::<f64>()?;
+            if mfreq < 1000.0 {
+                num_freq = mfreq * 1_000_000.0;
+            } else {
+                num_freq = mfreq;
+            }
+        }
+        else {
+            let nfreq = freq.parse::<u32>()?;
+            num_freq = nfreq as f64;
+        }
+        Ok(num_freq)
+    }
